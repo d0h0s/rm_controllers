@@ -76,9 +76,13 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   ros::NodeHandle nh_yaw = ros::NodeHandle(controller_nh, "yaw");
   ros::NodeHandle nh_pitch = ros::NodeHandle(controller_nh, "pitch");
   yaw_k_v_ = getParam(nh_yaw, "k_v", 0.);
-  pitch_k_v_ = getParam(nh_pitch, "k_v", 0.);
+  //  pitch_k_v_ = getParam(nh_pitch, "k_v", 0.);
   hardware_interface::EffortJointInterface* effort_joint_interface =
       robot_hw->get<hardware_interface::EffortJointInterface>();
+  if (!pos_pid_pitch_.init(ros::NodeHandle(nh_pitch, "pos_pid_pitch")))
+    return false;
+  if (!vel_pid_pitch_.init(ros::NodeHandle(nh_pitch, "vel_pid_pitch")))
+    return false;
   if (!ctrl_yaw_.init(effort_joint_interface, nh_yaw) || !ctrl_pitch_.init(effort_joint_interface, nh_pitch))
     return false;
   robot_state_handle_ = robot_hw->get<rm_control::RobotStateInterface>()->getHandle("robot_state");
@@ -359,11 +363,11 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   double roll_des, pitch_des, yaw_des;  // desired position
   quatToRPY(base_frame2des.transform.rotation, roll_des, pitch_des, yaw_des);
 
-  double yaw_vel_des = 0., pitch_vel_des = 0.;
+  double yaw_vel_des = 0.;
   if (state_ == RATE)
   {
     yaw_vel_des = cmd_gimbal_.rate_yaw;
-    pitch_vel_des = cmd_gimbal_.rate_pitch;
+    //    pitch_vel_des = cmd_gimbal_.rate_pitch;
   }
   else if (state_ == TRACK)
   {
@@ -390,16 +394,28 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
       tf2::doTransform(target_vel, target_vel, transform);
       tf2::fromMsg(target_pos, target_pos_tf);
       tf2::fromMsg(target_vel, target_vel_tf);
-      pitch_vel_des = target_pos_tf.cross(target_vel_tf).y() / std::pow((target_pos_tf.length()), 2);
+      //      pitch_vel_des = target_pos_tf.cross(target_vel_tf).y() / std::pow((target_pos_tf.length()), 2);
     }
     catch (tf2::TransformException& ex)
     {
       ROS_WARN("%s", ex.what());
     }
   }
+  // desire vel
+  double velocity_limit = ctrl_pitch_.joint_urdf_->limits ? ctrl_pitch_.joint_urdf_->limits->velocity : 1e16;
+  double pitch_vel_cmd =
+      std::abs(pos_pid_pitch_.computeCommand((pitch_des - ctrl_pitch_.joint_.getPosition()), period)) < velocity_limit ?
+          pos_pid_pitch_.computeCommand((pitch_des - ctrl_pitch_.joint_.getPosition()), period) :
+          ((pos_pid_pitch_.computeCommand((pitch_des - ctrl_pitch_.joint_.getPosition()), period) > 0 ? 1 : -1) *
+           velocity_limit);
+  //  double pitch_vel_cmd = pos_pid_pitch_.computeCommand((pitch_des - ctrl_pitch_.joint_.getPosition()), period);
 
+  double pitch_cmd = vel_pid_pitch_.computeCommand(pitch_vel_cmd - angular_vel_pitch.y, period);
+  // command effort
+  //  double yaw_cmd = vel_pid_yaw_.computeCommand(yaw_vel_cmd - angular_vel_yaw.z, period);
+  //  vel_ctrl_yaw_.joint_.setCommand(yaw_cmd);
   ctrl_yaw_.setCommand(yaw_des, yaw_vel_des + ctrl_yaw_.joint_.getVelocity() - angular_vel_yaw.z);
-  ctrl_pitch_.setCommand(pitch_des, pitch_vel_des + ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
+  //  ctrl_pitch_.setCommand(pitch_vel_cmd + ctrl_pitch_.joint_.getVelocity() - angular_vel_yaw.y);
   ctrl_yaw_.update(time, period);
   ctrl_pitch_.update(time, period);
   double resistance_compensation = 0.;
@@ -409,7 +425,7 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
     resistance_compensation = (ctrl_yaw_.joint_.getCommand() > 0 ? 1 : -1) * yaw_resistance_;
   ctrl_yaw_.joint_.setCommand(ctrl_yaw_.joint_.getCommand() - k_chassis_vel_ * chassis_vel_->angular_->z() +
                               yaw_k_v_ * yaw_vel_des + resistance_compensation);
-  ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + feedForward(time) + pitch_k_v_ * pitch_vel_des);
+  ctrl_pitch_.joint_.setCommand(pitch_cmd + feedForward(time));
 }
 
 double Controller::feedForward(const ros::Time& time)
